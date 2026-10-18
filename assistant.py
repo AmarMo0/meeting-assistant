@@ -24,6 +24,17 @@ def local_to_iso(value: str, timezone: str) -> str:
         tzinfo=ZoneInfo(timezone)
     ).isoformat()
 
+
+def find_conflicts(start_time: str, end_time: str) -> list[dict]:
+    service = get_calendar_service()
+
+    return list_calendar_events(
+        service=service,
+        calendar_id=calendar_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
 @tool
 def book_meeting(title:str , start_time:str , end_time:str, timezone: str = "Africa/Cairo") -> dict:
     """Create a meeting in Google Calendar.
@@ -36,14 +47,10 @@ def book_meeting(title:str , start_time:str , end_time:str, timezone: str = "Afr
     end_time = local_to_iso(end_time, timezone)
 
     service = get_calendar_service()
-    conflict = list_calendar_events(
-        service= service,
-        calendar_id=calendar_id,
-        start_time=start_time,
-        end_time=end_time,
-    )
-    if conflict:
-      return {"error": "This time overlaps an existing event."}
+    conflicts = find_conflicts(start_time, end_time)
+
+    if conflicts:
+        return {"error": "This time overlaps an existing event."}
     
     event = create_calendar_event(
         service=service,
@@ -175,22 +182,52 @@ def main():
 
             for interrupt in result["__interrupt__"]:
                 for action in interrupt.value["action_requests"]:
-                    print("\nProposed action:", action["name"])
+                    args = action["args"]
+                    timezone = args.get("timezone", "Africa/Cairo")
 
-                    for name, value in action["args"].items():
-                        print(f"  {name}: {value}")
+                    start = local_to_iso(args["start_time"], timezone)
+                    end = local_to_iso(args["end_time"], timezone)
 
-                    answer = input("Approve this booking? (yes/no): ")
-                    approved = answer.strip().lower() == "yes"
+                    conflicts = find_conflicts(start, end)
 
-                    decisions.append(
-                        {"type": "approve"}
-                        if approved
-                        else {
+                    if conflicts:
+                        print(
+                            "\nBooking blocked: this time overlaps "
+                            "an existing event."
+                        )
+
+                        decisions.append({
                             "type": "reject",
-                            "message": "The user rejected this booking.",
-                        }
-                    )
+                            "message": (
+                                "The application found overlapping events. "
+                                "No meeting was created. "
+                                "Ask the user for another time."
+                            ),
+                        })
+
+                        continue
+
+                    print("\nProposed booking")
+                    print("  Title:", args["title"])
+                    print("  Start:", start)
+                    print("  End:", end)
+                    print("  Timezone:", timezone)
+
+                    answer = input(
+                        "Approve this booking? (yes/no): "
+                    ).strip().lower()
+
+                    if answer == "yes":
+                        decisions.append({"type": "approve"})
+                    else:
+                        decisions.append({
+                            "type": "reject",
+                            "message": (
+                                "The user rejected this booking. "
+                                "No meeting was created. "
+                                "Do not retry unless asked."
+                            ),
+                        })
 
             result = agent.invoke(
                 Command(resume={"decisions": decisions}),
