@@ -57,7 +57,18 @@ def delete_calendar_event(service, calender_id, event_id):
     eventId=event_id,
     ).execute()
 
-
+def update_calendar_event(service, calendar_id, event_id, start_time, end_time):
+    changes = {
+        "start": {"dateTime": start_time},
+        "end": {"dateTime": end_time},
+    }
+    updated_event = service.events().patch(
+        calendarId=calendar_id,
+        eventId=event_id,
+        body=changes,
+        ).execute()
+    
+    return updated_event
 
 def list_calendar_events(service, calendar_id, start_time, end_time):
     result = service.events().list(

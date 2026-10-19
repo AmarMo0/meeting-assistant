@@ -5,7 +5,8 @@ from google_calendar import (
     get_calendar_service,
     create_calendar_event,
     list_calendar_events,
-    delete_calendar_event
+    delete_calendar_event,
+    update_calendar_event
 )
 from datetime import datetime
 from langchain.agents.middleware import HumanInTheLoopMiddleware
@@ -26,15 +27,22 @@ def local_to_iso(value: str, timezone: str) -> str:
     ).isoformat()
 
 
-def find_conflicts(start_time: str, end_time: str) -> list[dict]:
+def find_conflicts(start_time: str, end_time: str, exclude_event_id: str | None = None,) -> list[dict]:
     service = get_calendar_service()
 
-    return list_calendar_events(
+    events =  list_calendar_events(
         service=service,
         calendar_id=calendar_id,
         start_time=start_time,
         end_time=end_time,
+        
     )
+
+    return [
+    event
+    for event in events
+    if event["id"] != exclude_event_id
+    ]
 
 @tool
 def book_meeting(title:str , start_time:str , end_time:str, timezone: str = "Africa/Cairo") -> dict:
@@ -123,10 +131,60 @@ def delete_event(event_id: str) -> dict:
     "event_id": event_id,
     }
 
+@tool
+def reschedule_meeting(
+    event_id: str,
+    start_time: str,
+    end_time: str,
+    timezone: str = "Africa/Cairo",
+) -> dict:
+    """Reschedule an existing meeting.
+
+    Use an event ID returned by view_meeting.
+    Provide local times as YYYY-MM-DDTHH:MM without UTC offsets.
+    Pass the IANA timezone separately.
+    """
+
+    start_time = local_to_iso(start_time, timezone)
+    end_time = local_to_iso(end_time, timezone)
+
+    conflicts = find_conflicts(
+        start_time,
+        end_time,
+        exclude_event_id = event_id,
+    )
+
+    if conflicts:
+        return {"error": "The requested time overlaps another event."}
+
+    service = get_calendar_service()
+
+    event = update_calendar_event(
+        service=service,
+        calendar_id=calendar_id,
+        event_id=event_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    return {
+        "id": event["id"],
+        "title": event["summary"],
+        "start": event["start"],
+        "end": event["end"],
+        "link": event["htmlLink"],
+    }
+
+
 
 agent = create_agent(
     model= 'gpt-5-nano',
-    tools=[book_meeting, view_meeting, delete_event],
+    tools=[
+    book_meeting,
+    view_meeting,
+    delete_event,
+    reschedule_meeting,
+    ],
     checkpointer=InMemorySaver(),
     middleware=[HumanInTheLoopMiddleware(
         interrupt_on={
@@ -134,6 +192,9 @@ agent = create_agent(
                 "allowed_decisions": ["approve", "reject"]
                 },
             "delete_event": {
+                "allowed_decisions": ["approve", "reject"]
+                },
+            "reschedule_meeting": {
                 "allowed_decisions": ["approve", "reject"]
                 },
             }  
@@ -183,7 +244,15 @@ agent = create_agent(
             Never invent event IDs.
             Deletion approval is handled by the application.
             Confirm deletion only after the tool reports success.
-            You cannot edit meetings, add attendees, or set reminders.
+            You can reschedule meetings using reschedule_meeting.
+            Find the intended event using view_meeting and use its returned ID.
+            Ask for clarification if multiple events match.
+            Establish the new start and end before requesting rescheduling.
+            If the user only changes the start, preserve the original duration
+            unless they request otherwise.
+            Approval is handled by the application.
+            Confirm success only after the tool returns the updated event.
+            You cannot add attendees or set reminders.
             """
  
 )
@@ -228,6 +297,44 @@ def review_action(action: dict) -> dict:
         print("End:", event["end"])
         print("Event ID:", event["id"])
 
+    elif tool_name == "reschedule_meeting":
+        timezone = args.get("timezone", "Africa/Cairo")
+        start = local_to_iso(args["start_time"], timezone)
+        end = local_to_iso(args["end_time"], timezone)
+
+        conflicts = find_conflicts(
+            start,
+            end,
+            exclude_event_id=args["event_id"],
+        )
+
+        if conflicts:
+            print("\nRescheduling blocked: this time is occupied.")
+
+            return {
+                "type": "reject",
+                "message": (
+                    "The proposed time overlaps another event. "
+                    "The original meeting was not changed. "
+                    "Ask for another time."
+                ),
+            }
+
+        service = get_calendar_service()
+
+        event = service.events().get(
+            calendarId=calendar_id,
+            eventId=args["event_id"],
+        ).execute()
+
+        print("\nProposed reschedule")
+        print("Title:", event.get("summary", "Untitled"))
+        print("Current start:", event["start"])
+        print("Current end:", event["end"])
+        print("New start:", start)
+        print("New end:", end)
+        print("Requested timezone:", timezone)
+
     else:
         return {
             "type": "reject",
@@ -238,7 +345,7 @@ def review_action(action: dict) -> dict:
 
     if answer == "yes":
         return {"type": "approve"}
-
+    
     return {
         "type": "reject",
         "message": "The user rejected this action. Do not retry unless asked.",
