@@ -5,6 +5,7 @@ from google_calendar import (
     get_calendar_service,
     create_calendar_event,
     list_calendar_events,
+    delete_calendar_event
 )
 from datetime import datetime
 from langchain.agents.middleware import HumanInTheLoopMiddleware
@@ -90,26 +91,51 @@ def view_meeting(
         calendar_id=calendar_id,
         start_time=start_time,
         end_time=end_time,
+        
     )
     return [
         {
             "title": event.get("summary", "Untitled"),
             "start": event["start"],
             "end": event["end"],
+            "id": event["id"]
         }
         for event in events
     ]
     
+@tool
+def delete_event(event_id: str) -> dict:
+    """Delete a specific calendar event.
+
+    Use an event ID returned by view_meeting.
+    Never invent an event ID.
+    """
+    service = get_calendar_service()
+
+    delete_calendar_event(
+        service = service,
+        calender_id = calendar_id,
+        event_id = event_id
+    )
+
+    return {
+    "status": "deleted",
+    "event_id": event_id,
+    }
+
 
 agent = create_agent(
     model= 'gpt-5-nano',
-    tools=[book_meeting, view_meeting],
+    tools=[book_meeting, view_meeting, delete_event],
     checkpointer=InMemorySaver(),
     middleware=[HumanInTheLoopMiddleware(
         interrupt_on={
-                "book_meeting": {
-                    "allowed_decisions": ["approve", "reject"]
-                }
+            "book_meeting": {
+                "allowed_decisions": ["approve", "reject"]
+                },
+            "delete_event": {
+                "allowed_decisions": ["approve", "reject"]
+                },
             }  
         )   
     ],
@@ -151,12 +177,73 @@ agent = create_agent(
             Reading events does not require approval.
             Do not create a meeting when the user only asks to view their schedule.
 
-            You cannot edit or delete meetings, add attendees, or set reminders.
-            Do not offer these actions.
-            Keep replies concise.
+            You can delete meetings using delete_event.
+            First use view_meeting to find the intended event and its ID.
+            If multiple events match, ask the user which one they mean.
+            Never invent event IDs.
+            Deletion approval is handled by the application.
+            Confirm deletion only after the tool reports success.
+            You cannot edit meetings, add attendees, or set reminders.
             """
  
 )
+
+def review_action(action: dict) -> dict:
+    args = action["args"]
+    tool_name = action["name"]
+
+    if tool_name == "book_meeting":
+        timezone = args.get("timezone", "Africa/Cairo")
+        start = local_to_iso(args["start_time"], timezone)
+        end = local_to_iso(args["end_time"], timezone)
+
+        if find_conflicts(start, end):
+            print("\nBooking blocked: this time is occupied.")
+
+            return {
+                "type": "reject",
+                "message": (
+                    "Overlapping events were found. "
+                    "No meeting was created. Ask for another time."
+                ),
+            }
+
+        print("\nProposed booking")
+        print("Title:", args["title"])
+        print("Start:", start)
+        print("End:", end)
+        print("Timezone:", timezone)
+
+    elif tool_name == "delete_event":
+        service = get_calendar_service()
+
+        event = service.events().get(
+            calendarId=calendar_id,
+            eventId=args["event_id"],
+        ).execute()
+
+        print("\nProposed deletion")
+        print("Title:", event.get("summary", "Untitled"))
+        print("Start:", event["start"])
+        print("End:", event["end"])
+        print("Event ID:", event["id"])
+
+    else:
+        return {
+            "type": "reject",
+            "message": "This action has no configured approval handler.",
+        }
+
+    answer = input("Approve this action? (yes/no): ").strip().lower()
+
+    if answer == "yes":
+        return {"type": "approve"}
+
+    return {
+        "type": "reject",
+        "message": "The user rejected this action. Do not retry unless asked.",
+    }
+
 
 def main():
     config = {"configurable": {"thread_id": "meeting-assistant"}}
@@ -182,52 +269,8 @@ def main():
 
             for interrupt in result["__interrupt__"]:
                 for action in interrupt.value["action_requests"]:
-                    args = action["args"]
-                    timezone = args.get("timezone", "Africa/Cairo")
-
-                    start = local_to_iso(args["start_time"], timezone)
-                    end = local_to_iso(args["end_time"], timezone)
-
-                    conflicts = find_conflicts(start, end)
-
-                    if conflicts:
-                        print(
-                            "\nBooking blocked: this time overlaps "
-                            "an existing event."
-                        )
-
-                        decisions.append({
-                            "type": "reject",
-                            "message": (
-                                "The application found overlapping events. "
-                                "No meeting was created. "
-                                "Ask the user for another time."
-                            ),
-                        })
-
-                        continue
-
-                    print("\nProposed booking")
-                    print("  Title:", args["title"])
-                    print("  Start:", start)
-                    print("  End:", end)
-                    print("  Timezone:", timezone)
-
-                    answer = input(
-                        "Approve this booking? (yes/no): "
-                    ).strip().lower()
-
-                    if answer == "yes":
-                        decisions.append({"type": "approve"})
-                    else:
-                        decisions.append({
-                            "type": "reject",
-                            "message": (
-                                "The user rejected this booking. "
-                                "No meeting was created. "
-                                "Do not retry unless asked."
-                            ),
-                        })
+                    decision = review_action(action)
+                    decisions.append(decision)
 
             result = agent.invoke(
                 Command(resume={"decisions": decisions}),

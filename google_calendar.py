@@ -50,7 +50,15 @@ def get_calendar_service():
             token.write(creds.to_json())
 
     return build("calendar", "v3", credentials=creds)
-   
+
+def delete_calendar_event(service, calender_id, event_id):
+    service.events().delete(
+    calendarId=calender_id,
+    eventId=event_id,
+    ).execute()
+
+
+
 def list_calendar_events(service, calendar_id, start_time, end_time):
     result = service.events().list(
         calendarId=calendar_id,
